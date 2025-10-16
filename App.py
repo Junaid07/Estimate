@@ -1,239 +1,73 @@
-import io
+# ... keep the imports and parsing code exactly as before ...
+
 import re
-import hashlib
-from io import BytesIO
-from typing import List, Tuple
 
-import numpy as np
-import pandas as pd
-import pdfplumber
-import streamlit as st
-from rapidfuzz import process, fuzz
+# ---------- NEW: feature extraction helpers ----------
+CLASS_RX = re.compile(r'\bclass[-\s]*([ivx]+)\b', re.IGNORECASE)
+MM_RX    = re.compile(r'(\d{2,4})\s*mm\b', re.IGNORECASE)
+PSI_RX   = re.compile(r'(\d{3,5})\s*psi\b', re.IGNORECASE)
+TYPE_RX  = re.compile(r'\b(R\.?C\.?C\.?|concrete|PVC|HDPE|DI)\b', re.IGNORECASE)
 
-
-# ---------------------------
-# Streamlit page config
-# ---------------------------
-st.set_page_config(page_title="MRS PDF → BOQ", layout="wide")
-st.title("📘 MRS / SoR PDF → BOQ Builder")
-
-st.markdown(
-    "Upload your **MRS/SoR PDF**. Type item keywords, select a match, "
-    "enter quantity & rate type, then add to BOQ and download Excel."
-)
-
-
-# ---------------------------
-# PDF → table parser (inline)
-# ---------------------------
-CHAPTER_RX = re.compile(
-    r'(CHAPTER\s*NO?\.?\s*\d+.*|Chap-?\s*\d+.*|Chapter\s*\d+.*)',
-    re.IGNORECASE
-)
-ITEM_RX = re.compile(r'^\s*(([ivxlcdm]+\))|(\d+\))|([a-z]\)))', re.IGNORECASE)
-
-
-def _split_unit_value(cell: str) -> Tuple[str, str]:
-    """Split a cell like 'Per Rft. 1,003.95' → ('Per Rft.', '1003.95')."""
-    if not cell:
-        return (None, None)
-    parts = cell.split()
-    if len(parts) >= 2:
-        unit = " ".join(parts[:-1])
-        val = parts[-1].replace(",", "")
-        return (unit, val)
-    return (None, cell.replace(",", ""))
-
-
-def _find_col(header_norm: List[str], cands: List[str]):
-    for i, h in enumerate(header_norm):
-        for c in cands:
-            if c in h:
-                return i
-    return None
-
-
-def extract_tables_with_context_from_bytes(pdf_bytes: bytes) -> pd.DataFrame:
+def extract_features(desc: str) -> dict:
     """
-    Parse tables from a PDF (bytes) with page + chapter context.
-    Returns a tidy DataFrame ready for search/BOQ.
+    Pull structured attributes from the item description:
+    - base: description with sizes/classes removed (for grouping 'family')
+    - cls:  roman class like II, III, IV
+    - mm:   diameter in mm (int) if present
+    - psi:  pressure rating if present (int)
+    - typ:  pipe/material hint like RCC, PVC, etc.
     """
-    rows = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        current_chapter = None
-        for page_idx, page in enumerate(pdf.pages, start=1):
-            page_text = page.extract_text() or ""
+    d = desc or ""
+    cls = None
+    mm  = None
+    psi = None
+    typ = None
 
-            # Update current chapter from visible text
-            for line in page_text.splitlines():
-                m = CHAPTER_RX.search(line)
-                if m:
-                    current_chapter = m.group(0).strip()
-                    break
+    m = CLASS_RX.search(d)
+    if m:
+        cls = m.group(1).upper()
 
-            # Try extracting tables
-            try:
-                tables = page.extract_tables()
-            except Exception:
-                tables = []
+    m = MM_RX.search(d)
+    if m:
+        try: mm = int(m.group(1))
+        except: mm = None
 
-            if not tables:
-                # Fallback: store lines as unstructured descriptions
-                for line in page_text.splitlines():
-                    if not line.strip():
-                        continue
-                    rows.append({
-                        "chapter": current_chapter,
-                        "section": None,
-                        "item_no": None,
-                        "description": line.strip(),
-                        "unit_british": None,
-                        "labour_british": None,
-                        "composite_british": None,
-                        "unit_metric": None,
-                        "labour_metric": None,
-                        "composite_metric": None,
-                        "spec_no": None,
-                        "remarks": None,
-                        "page_no": page_idx,
-                    })
-                continue
+    m = PSI_RX.search(d)
+    if m:
+        try: psi = int(m.group(1))
+        except: psi = None
 
-            for tbl in tables:
-                tbl = [[(c or "").strip() for c in row] for row in tbl]
-                if len(tbl) < 2:
-                    continue
+    m = TYPE_RX.search(d)
+    if m:
+        typ = m.group(1).upper().replace('.', '')
 
-                # Try to detect header row
-                header_idx = None
-                for i, row in enumerate(tbl[:3]):
-                    joined = " ".join(row).lower()
-                    if "rate" in joined and ("unit" in joined or "labour" in joined or "composite" in joined):
-                        header_idx = i
-                        break
+    # Build a "base family" string: remove class + mm + psi tokens for grouping
+    base = d
+    base = CLASS_RX.sub('', base)
+    base = MM_RX.sub('', base)
+    base = PSI_RX.sub('', base)
+    base = re.sub(r'\s+', ' ', base).strip()
 
-                if header_idx is None:
-                    header = [f"col_{i}" for i in range(len(tbl[0]))]
-                    data_rows = tbl
-                else:
-                    header = tbl[header_idx]
-                    data_rows = tbl[header_idx + 1:]
+    return {"base": base, "cls": cls, "mm": mm, "psi": psi, "typ": typ}
 
-                header_norm = [h.lower().strip() for h in header]
-
-                desc_col = _find_col(header_norm, ["description"]) or 0
-                brit_col = _find_col(header_norm, ["rate (british system)", "british", "rate (british)"])
-                lab_b_col = _find_col(header_norm, ["labour"])
-                comp_b_col = _find_col(header_norm, ["composite"])
-                metric_col = _find_col(header_norm, ["rate (metric system)", "metric", "rate (metric)"])
-                spec_col = _find_col(header_norm, ["spec", "spec."])
-                rem_col = _find_col(header_norm, ["remark"])
-
-                def safe(row, i):
-                    return row[i].strip() if (i is not None and i < len(row) and row[i]) else None
-
-                for r in data_rows:
-                    if all(not (c and c.strip()) for c in r):
-                        continue
-
-                    description = r[desc_col] if desc_col is not None and desc_col < len(r) else " ".join(r).strip()
-
-                    item_no = None
-                    m = ITEM_RX.match(description or "")
-                    if m:
-                        item_no = (m.group(0) or "").strip()
-
-                    unit_british, labour_british, composite_british = None, None, None
-                    unit_metric, labour_metric, composite_metric = None, None, None
-
-                    # British
-                    if brit_col is not None:
-                        ub = safe(r, brit_col)
-                        unit_british, _ = _split_unit_value(ub)
-                    if lab_b_col is not None:
-                        lb = safe(r, lab_b_col)
-                        labour_british = lb.replace(",", "") if lb else None
-                    if comp_b_col is not None:
-                        cb = safe(r, comp_b_col)
-                        composite_british = cb.replace(",", "") if cb else None
-
-                    # Metric
-                    if metric_col is not None:
-                        um = safe(r, metric_col)
-                        unit_metric, _ = _split_unit_value(um)
-                        # Often Labour/Composite follow metric column
-                        lm = safe(r, metric_col + 1)
-                        cm = safe(r, metric_col + 2)
-                        labour_metric = lm.replace(",", "") if lm else None
-                        composite_metric = cm.replace(",", "") if cm else None
-
-                    rows.append({
-                        "chapter": current_chapter,
-                        "section": None,
-                        "item_no": item_no,
-                        "description": description,
-                        "unit_british": unit_british,
-                        "labour_british": labour_british,
-                        "composite_british": composite_british,
-                        "unit_metric": unit_metric,
-                        "labour_metric": labour_metric,
-                        "composite_metric": composite_metric,
-                        "spec_no": safe(r, spec_col),
-                        "remarks": safe(r, rem_col),
-                        "page_no": page_idx,
-                    })
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    df["description"] = (
-        df["description"].astype(str)
-        .str.replace(r"\s+", " ", regex=True)
-        .str.strip()
+def enrich(df):
+    feats = df["description"].astype(str).apply(extract_features).apply(pd.Series)
+    for c in feats.columns:
+        df[c] = feats[c]
+    # a compact key to ensure exact selection when needed
+    df["variant_key"] = (
+        (df["cls"].fillna('')) + "|" +
+        df["psi"].fillna(0).astype(str) + "|" +
+        df["mm"].fillna(0).astype(int).astype(str)
     )
-    df = df[df["description"].str.len() > 1].copy()
     return df
 
-
-# ---------------------------
-# Caching by file content
-# ---------------------------
-@st.cache_data(show_spinner=False)
-def _hash_bytes(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
-
-
-@st.cache_data(show_spinner=True)
-def parse_pdf_cached(pdf_bytes: bytes) -> pd.DataFrame:
-    return extract_tables_with_context_from_bytes(pdf_bytes)
-
-
-# ---------------------------
-# Sidebar: upload PDF
-# ---------------------------
-st.sidebar.header("📁 Upload PDF")
-pdf_file = st.sidebar.file_uploader("MRS/SoR PDF", type=["pdf"])
-
-df = None
-if pdf_file is not None:
-    pdf_bytes = pdf_file.read()
-    file_hash = _hash_bytes(pdf_bytes)
-    with st.spinner("Parsing PDF… (first time only, then cached)"):
-        df = parse_pdf_cached(pdf_bytes)
-
-    if df is None or df.empty:
-        st.error("No table-like content found. If your PDF is scanned, OCR it first or share a sample page to tune the parser.")
-else:
-    st.info("Upload your MRS/SoR PDF to begin.")
-
-
-# ---------------------------
-# When we have data, show UI
-# ---------------------------
+# --------------------------- (inside your main flow, after df is parsed) ---------------------------
 if df is not None and not df.empty:
+    df = enrich(df)  # <--- NEW: add structured columns
     st.success(f"Parsed {len(df):,} rows from PDF.")
-    # Filters
+
+    # --- Filters as before ---
     c1, c2 = st.columns(2)
     with c1:
         chapters = sorted([c for c in df["chapter"].dropna().unique().tolist() if c])
@@ -247,30 +81,82 @@ if df is not None and not df.empty:
         dff = dff[dff["chapter"].isin(ch_pick)]
     dff = dff[(dff["page_no"] >= pr[0]) & (dff["page_no"] <= pr[1])]
 
-    # Search box with fuzzy suggestions
+    # --- Search a 'family' with fuzzy ---
     st.subheader("🔎 Search")
-    query = st.text_input("Type item keywords (e.g., 'Class-III 610 mm sewer')", "")
+    query = st.text_input("Type item keywords (e.g., 'RCC pipe laying Class-III 610 mm')", "")
     top_n = st.slider("Suggestions to show", 5, 20, 8)
 
     def get_suggestions(q, pool, n=8):
         if not q or len(q.strip()) < 2:
             return []
+        from rapidfuzz import process, fuzz
         return process.extract(q, pool, scorer=fuzz.WRatio, limit=n)
 
-    pool = dff["description"].astype(str).tolist()
-    suggestions = get_suggestions(query, pool, n=top_n)
+    # We search over BASE family strings to group all sub-items under one umbrella
+    families = dff["base"].fillna(dff["description"]).astype(str).tolist()
+    suggestions = get_suggestions(query, families, n=top_n)
 
-    pick = None
+    base_pick = None
     if suggestions:
-        labels = [f"{txt}  —  (score {int(score)})" for txt, score, _ in suggestions]
-        idx = st.radio("Closest matches", list(range(len(labels))), format_func=lambda i: labels[i], index=0)
-        pick = suggestions[idx][0]
+        # de-duplicate labels that repeat
+        uniq = []
+        for txt, score, idx in suggestions:
+            if txt not in (x[0] for x in uniq):
+                uniq.append((txt, score, idx))
+        labels = [f"{txt}  —  (score {int(score)})" for (txt, score, idx) in uniq]
+        idx = st.radio("Closest base matches (pick one)", list(range(len(labels))), format_func=lambda i: labels[i], index=0)
+        base_pick = uniq[idx][0]
 
-    # Show selected item details & add to BOQ
-    if pick:
-        sel = dff.loc[dff["description"] == pick].head(1).squeeze()
+    # --- Guided picker for sub-options (class / psi / mm) ---
+    selected_row = None
+    if base_pick:
+        fam_df = dff[dff["base"] == base_pick].copy()
+        st.markdown("#### Available variants in this family")
 
-        st.subheader("📄 Selected Item")
+        # Show quick summary table (read-only) for user
+        show_cols = ["description", "cls", "psi", "mm", "unit_british", "labour_british", "composite_british", "unit_metric", "labour_metric", "composite_metric", "page_no"]
+        st.dataframe(fam_df[show_cols].sort_values(["cls","psi","mm"], na_position="last"), use_container_width=True, height=320)
+
+        # Build filter widgets from available values
+        cA, cB, cC, cD = st.columns(4)
+        with cA:
+            typ_opt = sorted([x for x in fam_df["typ"].dropna().unique().tolist()])
+            typ_val = st.selectbox("Type", ["(any)"] + typ_opt, index=0)
+        with cB:
+            cls_opt = sorted([x for x in fam_df["cls"].dropna().unique().tolist()])
+            cls_val = st.selectbox("Class", ["(any)"] + cls_opt, index=0)
+        with cC:
+            psi_opt = sorted([int(x) for x in fam_df["psi"].dropna().unique().tolist()])
+            psi_val = st.selectbox("PSI", ["(any)"] + [str(x) for x in psi_opt], index=0)
+        with cD:
+            mm_opt = sorted([int(x) for x in fam_df["mm"].dropna().unique().tolist()])
+            mm_val = st.selectbox("Diameter (mm)", ["(any)"] + [str(x) for x in mm_opt], index=0)
+
+        # Apply filters progressively
+        f = fam_df.copy()
+        if typ_val != "(any)":
+            f = f[f["typ"] == typ_val]
+        if cls_val != "(any)":
+            f = f[f["cls"] == cls_val]
+        if psi_val != "(any)":
+            f = f[f["psi"] == int(psi_val)]
+        if mm_val != "(any)":
+            f = f[f["mm"] == int(mm_val)]
+
+        if len(f) == 0:
+            st.warning("No row matches these filters. Loosen one of them.")
+        elif len(f) > 1:
+            st.info("Multiple rows match—pick the exact description below:")
+            row_labels = [f"{r['description']} (Pg {int(r['page_no'])})" for _, r in f.iterrows()]
+            pick_i = st.selectbox("Exact sub-item", list(range(len(row_labels))), format_func=lambda i: row_labels[i])
+            selected_row = f.iloc[pick_i]
+        else:
+            selected_row = f.iloc[0]
+
+    # --- When a single row is selected, show rates + BOQ ---
+    if selected_row is not None:
+        sel = selected_row
+        st.subheader("📄 Selected Sub-Item")
         cL, cR = st.columns(2)
         with cL:
             st.markdown(f"**Description:** {sel.get('description','')}")
@@ -278,10 +164,11 @@ if df is not None and not df.empty:
             st.markdown(f"**Item No.:** {sel.get('item_no','') or ''}")
             st.markdown(f"**Page:** {int(sel.get('page_no', 0)) if pd.notna(sel.get('page_no', np.nan)) else ''}")
         with cR:
+            st.markdown(f"**Class:** {sel.get('cls','') or ''}   **PSI:** {str(sel.get('psi','') or '')}   **Diameter:** {str(sel.get('mm','') or '')} mm")
             st.markdown(f"**Spec No.:** {sel.get('spec_no','') or ''}")
             st.markdown(f"**Remarks:** {sel.get('remarks','') or ''}")
 
-        st.markdown("**Rates**")
+        st.markdown("**Rates** (auto-parsed)")
         rate_df = pd.DataFrame({
             "System": ["British", "Metric"],
             "Unit": [sel.get("unit_british",""), sel.get("unit_metric","")],
@@ -293,16 +180,11 @@ if df is not None and not df.empty:
         st.divider()
         st.subheader("➕ Add to BOQ")
         qty = st.number_input("Quantity", min_value=0.0, step=1.0, value=0.0)
-        rate_choice = st.selectbox(
-            "Use rate",
-            ["Composite (British)", "Composite (Metric)", "Labour (British)", "Labour (Metric)"]
-        )
+        rate_choice = st.selectbox("Use rate", ["Composite (British)", "Composite (Metric)", "Labour (British)", "Labour (Metric)"])
 
         def to_float(x):
-            try:
-                return float(str(x).replace(",", ""))
-            except Exception:
-                return np.nan
+            try: return float(str(x).replace(",", ""))
+            except: return np.nan
 
         if rate_choice == "Composite (British)":
             unit = sel.get("unit_british", "")
@@ -318,14 +200,11 @@ if df is not None and not df.empty:
             rate_val = to_float(sel.get("labour_metric", np.nan))
 
         amount = (qty or 0.0) * (rate_val if not np.isnan(rate_val) else 0.0)
-
         st.markdown(f"**Unit:** {unit}")
         st.markdown(f"**Rate:** {'' if np.isnan(rate_val) else rate_val}")
         st.markdown(f"**Amount:** {amount:,.2f}")
 
-        if "boq" not in st.session_state:
-            st.session_state.boq = []
-
+        if "boq" not in st.session_state: st.session_state.boq = []
         if st.button("Add line"):
             st.session_state.boq.append({
                 "Description": sel.get("description",""),
@@ -339,23 +218,20 @@ if df is not None and not df.empty:
             })
             st.success("Added to BOQ.")
 
-    # BOQ table + download
+    # --- BOQ table + download (unchanged) ---
     st.divider()
     st.subheader("📊 BOQ")
     boq_df = pd.DataFrame(st.session_state.get("boq", []))
     if boq_df.empty:
-        st.info("BOQ is empty. Search an item and click **Add line**.")
+        st.info("BOQ is empty. Use the guided picker above.")
     else:
         st.dataframe(boq_df, use_container_width=True)
         total = boq_df["Amount"].sum()
         st.markdown(f"**Total:** {total:,.2f}")
-
         out = BytesIO()
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
             boq_df.to_excel(writer, index=False, sheet_name="BOQ")
-        st.download_button(
-            "⬇️ Download BOQ.xlsx",
-            data=out.getvalue(),
-            file_name="BOQ.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        st.download_button("⬇️ Download BOQ.xlsx",
+                           data=out.getvalue(),
+                           file_name="BOQ.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
